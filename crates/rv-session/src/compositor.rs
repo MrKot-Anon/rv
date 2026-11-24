@@ -44,11 +44,8 @@ impl Framebuffer {
                     Apply::Ignored
                 }
             }
-            // Cursor pseudo-rects carry the hotspot in `x`/`y`, not a screen
-            // position; painting them into the framebuffer draws the cursor
-            // bitmap in the top-left corner. The session does not advertise
-            // the cursor pseudo-encoding, so servers keep rendering the
-            // pointer into ordinary updates and this stays a no-op.
+            // RV shows the local OS pointer. Cursor pseudo-rects are consumed
+            // by the decoder but are deliberately not painted into the frame.
             VncEvent::SetCursor(..) => Apply::Ignored,
             VncEvent::Text(text) => Apply::Clipboard(text),
             VncEvent::Bell => Apply::Bell,

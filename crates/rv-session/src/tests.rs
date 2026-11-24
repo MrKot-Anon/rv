@@ -492,9 +492,21 @@ fn ard_missing_credentials_explain_mac_login_requirement() {
         Some("test-password"),
         "Mac requires a username and password",
     );
-    assert_ard_rejected(
-        Some("test-user"),
-        None,
-        "Mac requires a username and password",
-    );
+}
+
+#[test]
+fn vnc_password_required_requests_input_instead_of_failing() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = thread::spawn(move || {
+        let (mut sock, _) = listener.accept().unwrap();
+        sock.write_all(b"RFB 003.008\n").unwrap();
+        assert_eq!(read_exact(&mut sock, 12), b"RFB 003.008\n");
+        sock.write_all(&[1, 2]).unwrap();
+    });
+    let handle = SessionHandle::spawn(request_for(port));
+    assert!(wait_for(&handle, Duration::from_secs(5), |event| {
+        matches!(event, SessionEvent::PasswordRequired)
+    }));
+    server.join().unwrap();
 }

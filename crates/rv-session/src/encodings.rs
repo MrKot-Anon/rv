@@ -13,8 +13,9 @@ pub fn encodings_for(quality: QualityPreset) -> Vec<VncEncoding> {
         ],
     };
     list.push(VncEncoding::DesktopSizePseudo);
-    // No `CursorPseudo`: the compositor has no local cursor layer, so the
-    // server must keep drawing the pointer into the framebuffer itself.
+    // Ask the server to send cursor shape separately. RV uses the local OS
+    // pointer at the exact mouse position and ignores the server's cursor image.
+    list.push(VncEncoding::CursorPseudo);
     list.push(VncEncoding::Raw);
     list
 }
@@ -33,7 +34,7 @@ mod tests {
             let e = encodings_for(q);
             assert!(e.contains(&VncEncoding::Raw));
             assert!(e.contains(&VncEncoding::DesktopSizePseudo));
-            assert!(!e.contains(&VncEncoding::CursorPseudo));
+            assert!(e.contains(&VncEncoding::CursorPseudo));
         }
     }
 }

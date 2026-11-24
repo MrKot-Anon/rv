@@ -7,19 +7,12 @@ use thiserror::Error;
 
 use crate::{Connection, ConnectionId, Preferences};
 
-#[cfg(not(target_os = "macos"))]
-const SERVICE: &str = "rv";
-
 #[derive(Debug, Error)]
 pub enum StoreError {
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
-    #[error("keychain error: {0}")]
-    Keyring(String),
-    #[error("Keychain authentication was cancelled")]
-    AuthenticationCancelled,
     #[error("unknown connection")]
     UnknownConnection,
 }
@@ -221,42 +214,62 @@ impl AddressBook {
     }
 }
 
-pub fn password_key(id: ConnectionId) -> String {
-    id.to_string()
-}
-
-#[cfg(target_os = "macos")]
-pub use crate::macos_keychain::{delete_password, load_password, save_password};
-
-#[cfg(not(target_os = "macos"))]
 pub fn save_password(id: ConnectionId, password: &str) -> Result<(), StoreError> {
-    let entry = keyring::Entry::new(SERVICE, &password_key(id))
-        .map_err(|e| StoreError::Keyring(e.to_string()))?;
-    entry
-        .set_password(password)
-        .map_err(|e| StoreError::Keyring(e.to_string()))
+    let path = password_path(id)?;
+    save_password_at(&path, password)
 }
 
-#[cfg(not(target_os = "macos"))]
 pub fn load_password(id: ConnectionId) -> Result<Option<String>, StoreError> {
-    let entry = keyring::Entry::new(SERVICE, &password_key(id))
-        .map_err(|e| StoreError::Keyring(e.to_string()))?;
-    match entry.get_password() {
-        Ok(p) => Ok(Some(p)),
-        Err(keyring::Error::NoEntry) => Ok(None),
-        Err(e) => Err(StoreError::Keyring(e.to_string())),
+    let path = password_path(id)?;
+    match fs::read_to_string(path) {
+        Ok(password) => Ok(Some(password)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.into()),
     }
 }
 
-#[cfg(not(target_os = "macos"))]
 pub fn delete_password(id: ConnectionId) -> Result<(), StoreError> {
-    let entry = keyring::Entry::new(SERVICE, &password_key(id))
-        .map_err(|e| StoreError::Keyring(e.to_string()))?;
-    match entry.delete_credential() {
+    let path = password_path(id)?;
+    match fs::remove_file(path) {
         Ok(()) => Ok(()),
-        Err(keyring::Error::NoEntry) => Ok(()),
-        Err(e) => Err(StoreError::Keyring(e.to_string())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.into()),
     }
+}
+
+fn password_path(id: ConnectionId) -> Result<PathBuf, StoreError> {
+    Ok(StorePaths::default_dir()?
+        .root
+        .join("credentials")
+        .join(format!("{id}.txt")))
+}
+
+fn save_password_at(path: &Path, password: &str) -> Result<(), StoreError> {
+    use std::fs::OpenOptions;
+    #[cfg(unix)]
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    let dir = path.parent().expect("credential path has parent");
+    fs::create_dir_all(dir)?;
+    #[cfg(unix)]
+    fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+
+    let tmp = dir.join(format!(".{}.tmp", uuid::Uuid::new_v4()));
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options.open(&tmp)?;
+    let result = (|| -> Result<(), StoreError> {
+        file.write_all(password.as_bytes())?;
+        file.sync_all()?;
+        fs::rename(&tmp, path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(tmp);
+    }
+    result
 }
 
 /// `Ok(None)` when the file does not exist.
@@ -355,6 +368,32 @@ mod tests {
         assert_eq!(reloaded.labels(), vec!["lab".to_string()]);
         assert_eq!(reloaded.filtered("off", None).len(), 1);
         assert_eq!(reloaded.filtered("", Some("lab")).len(), 1);
+    }
+
+    #[test]
+    fn local_password_file_round_trip() {
+        let guard = tempfile_dir::Guard::new();
+        let path = guard.path().join("credentials").join("test.txt");
+        save_password_at(&path, "first password").unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "first password");
+        save_password_at(&path, "updated password").unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "updated password");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(path.parent().unwrap())
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
     }
 
     #[test]

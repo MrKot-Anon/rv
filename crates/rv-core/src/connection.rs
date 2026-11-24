@@ -111,7 +111,7 @@ impl ScaleMode {
     }
 }
 
-/// A saved address-book entry. Passwords live in the OS keychain, never here.
+/// A saved address-book entry. Passwords live in separate local credential files.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Connection {
     pub id: ConnectionId,

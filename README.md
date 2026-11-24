@@ -16,8 +16,7 @@ A native desktop VNC viewer written in Rust with [GPUI](https://www.gpui.rs/). D
 - VNC Auth, Tight / ZRLE / TRLE / Raw encodings
 - Mac Screen Sharing / Apple Remote Desktop (ARD) login using the **Username** and **Password** fields in connection properties. ARD encrypts credentials, but requires no legacy VNC password setting on the Mac. Use **Let server choose**; **Always on** still requires VeNCrypt session TLS.
 - VeNCrypt TLS: `TLSVnc` / `TLSNone` (anonymous TLS, TigerVNC's default) via OpenSSL, `X509Vnc` / `X509None` via rustls with WebPKI roots. `Let server choose` picks encryption automatically when the server offers nothing else
-- Passwords stored in the OS keychain
-- Touch ID for saved passwords in signed macOS builds (with macOS password fallback)
+- Optional saved passwords in local files under the user's application data directory
 
 ## Build
 
@@ -78,7 +77,16 @@ RV_MOCK_SIZE=1280x800 RV_MOCK_RECTS=8 cargo run -p rv-session --example mock_ser
 RV_DATA_DIR=/tmp/rv-scratch cargo run -p rv-app -- 127.0.0.1:5999
 ```
 
+For pointer diagnostics, use `RV_MOCK_SIZE=1920x1080 RV_MOCK_LOG_MOTION=1` on
+the server. It prints every received pointer position and draws a white
+crosshair at that position in the framebuffer. Buttons 1, 8, and 16 in the
+printed mask correspond to left click, wheel up, and wheel down.
+
 `RV_DATA_DIR` overrides the address-book location (default: the platform data directory).
+
+RV detects the extra framebuffer rows used by x11vnc `-ncache` when the server
+advertises a very tall exact multiple of a common desktop size. It displays
+only the top desktop while retaining the cache rows for VNC CopyRect updates.
 
 To test Mac authentication locally:
 
@@ -93,34 +101,20 @@ logins. ARD mode takes precedence over `RV_MOCK_TLS`. Automated TCP tests cover
 accepted/rejected logins, missing credentials, desktop frames, and input after
 authentication; malformed DH parameters and credential byte limits have unit tests.
 
-## macOS signing and Touch ID
+## macOS app bundle
 
-Touch ID-protected passwords require a Developer ID-signed app and a matching macOS
-Developer ID provisioning profile for `io.github.madeye.rv`. Package a release build with:
+Package a release build with:
 
 ```bash
 cargo build --release -p rv-app --locked
 python3 scripts/package-macos.py \
-  --binary target/release/rv --output target/release/RV.app \
-  --identity "$RV_SIGN_IDENTITY" --profile "$RV_PROVISION_PROFILE"
+  --binary target/release/rv --output target/release/RV.app
 ```
 
-The packager embeds the profile, derives the app's Keychain entitlements from it,
-and verifies the signature. Omit both signing arguments for an ad-hoc bundle;
-ad-hoc builds and plain `cargo run` cannot access protected saved passwords. VNC
-connections with **Remember password** turned off still work in those builds.
-
-On first use, existing login-Keychain passwords are copied into the protected
-Keychain, then removed from the old store. macOS may request the login password
-once to authorize reading an old entry. Later reads use Touch ID when available;
-macOS retains its password fallback for unavailable or locked-out biometrics.
-Cancelling authentication cancels the connection attempt. Editing connection
-settings leaves saved passwords untouched unless a replacement is entered.
-
-For a manual authentication check, run `cargo build -p rv-core --example keychain_roundtrip`,
-package `target/debug/examples/keychain_roundtrip` with the
-same signing arguments, and run that bundle's `Contents/MacOS/rv` executable. The
-check creates, updates, authenticates, and removes a temporary test credential.
+Saved passwords are stored as plain text in separate files inside
+`credentials/` under the app's data directory. On Unix, the directory is mode
+`0700` and each file is mode `0600`. Existing Keychain passwords are not imported;
+enter them again to save them locally.
 
 ## Layout
 

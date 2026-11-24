@@ -10,7 +10,9 @@ use gpui::*;
 use gpui_component::{
     Disableable as _, Icon, IconName, Selectable as _, Sizable, StyledExt, TitleBar,
     button::{Button, ButtonVariants as _},
-    h_flex, v_flex,
+    h_flex,
+    input::{Input, InputState},
+    v_flex,
 };
 use image::{ImageBuffer, Rgba};
 use smallvec::SmallVec;
@@ -27,6 +29,7 @@ pub struct SessionOptions {
     pub menu_key: String,
     pub hide_shots: bool,
     pub thumb_path: Option<PathBuf>,
+    pub remember_password: bool,
 }
 
 /// Pixels of scroll per RFB wheel click. One notch of a mouse wheel is one
@@ -84,10 +87,14 @@ pub struct SessionView {
     menu_key: String,
     hide_shots: bool,
     thumb_path: Option<PathBuf>,
+    remember_password: bool,
     show_menu: bool,
     info_open: bool,
     buttons: u8,
+    last_pointer: Option<(u16, u16)>,
     wheel_accum: Point<f32>,
+    password_prompt: bool,
+    prompt_input: Entity<InputState>,
     last_generation: u64,
     render_image: Option<Arc<RenderImage>>,
     fb_w: u16,
@@ -98,10 +105,6 @@ pub struct SessionView {
     image_box: Rc<Cell<Bounds<Pixels>>>,
     keys: Keyboard,
     focus: FocusHandle,
-    canvas_hovered: bool,
-    pointer_in_window: bool,
-    local_cursor: local_cursor::LocalCursor,
-    _cursor_subscriptions: Vec<Subscription>,
 }
 
 impl SessionView {
@@ -126,17 +129,18 @@ impl SessionView {
     ) -> Self {
         let focus = cx.focus_handle();
         focus.focus(window, cx);
-        let cursor_subscriptions = vec![
-            cx.observe_window_activation(window, Self::update_local_cursor),
-            cx.on_focus(&focus, window, Self::update_local_cursor),
-            cx.on_blur(&focus, window, Self::update_local_cursor),
-        ];
+        let prompt_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("VNC password")
+                .masked(true)
+        });
         let SessionOptions {
             scale,
             pin_toolbar,
             menu_key,
             hide_shots,
             thumb_path,
+            remember_password,
         } = options;
         cx.spawn(async move |this, cx| {
             loop {
@@ -162,10 +166,14 @@ impl SessionView {
             menu_key,
             hide_shots,
             thumb_path,
+            remember_password,
             show_menu: false,
             info_open: false,
             buttons: 0,
+            last_pointer: None,
             wheel_accum: point(0.0, 0.0),
+            password_prompt: false,
+            prompt_input,
             last_generation: 0,
             render_image: None,
             fb_w: 0,
@@ -174,26 +182,7 @@ impl SessionView {
             image_box: Rc::new(Cell::new(Bounds::default())),
             keys: Keyboard::new(),
             focus,
-            canvas_hovered: false,
-            pointer_in_window: true,
-            local_cursor: local_cursor::LocalCursor::default(),
-            _cursor_subscriptions: cursor_subscriptions,
         }
-    }
-
-    fn update_local_cursor(&mut self, window: &mut Window, _: &mut Context<Self>) {
-        // The server paints its pointer into the framebuffer. Only hide ours
-        // over the live picture; letterboxing and local controls keep a cursor.
-        let hidden = self.phase == Phase::Connected
-            && self.render_image.is_some()
-            && !self.view_only()
-            && !self.show_menu
-            && self.canvas_hovered
-            && self.pointer_in_window
-            && window.is_window_active()
-            && self.focus.is_focused(window)
-            && self.map_pointer(window.mouse_position()).is_some();
-        self.local_cursor.set_hidden(hidden);
     }
 
     fn view_only(&self) -> bool {
@@ -215,11 +204,16 @@ impl SessionView {
             changed = true;
             match ev {
                 SessionEvent::Status(s) => self.status = s.into(),
+                SessionEvent::PasswordRequired => {
+                    self.phase = Phase::Ended;
+                    self.password_prompt = true;
+                    self.status = "Password required".into();
+                }
                 SessionEvent::Connected { width, height } => {
                     self.fb_w = width;
-                    self.fb_h = height;
+                    self.fb_h = visible_fb_height(width, height);
                     self.phase = Phase::Connected;
-                    self.status = format!("{width}×{height}").into();
+                    self.status = format!("{width}×{}", self.fb_h).into();
                     self.error = None;
                 }
                 SessionEvent::FrameReady { generation } => frame = Some(generation),
@@ -233,7 +227,6 @@ impl SessionView {
                     self.status = e.into();
                 }
                 SessionEvent::Disconnected => {
-                    self.local_cursor.set_hidden(false);
                     if self.error.is_none() {
                         self.status = "Disconnected".into();
                     }
@@ -260,13 +253,16 @@ impl SessionView {
                 return;
             };
             self.fb_w = fb.width;
-            self.fb_h = fb.height;
+            self.fb_h = visible_fb_height(fb.width, fb.height);
             if fb.width == 0 || fb.height == 0 {
                 return;
             }
+            let visible_bytes = fb.width as usize * self.fb_h as usize * 4;
             // The compositor already stores BGRA, which is what RenderImage
-            // uploads, so this is a plain copy.
-            (fb.width, fb.height, fb.pixels.clone())
+            // uploads. A server using x11vnc's -ncache advertises extra rows
+            // below the desktop; keep them in the compositor for CopyRect but
+            // do not upload or display them.
+            (fb.width, self.fb_h, fb.pixels[..visible_bytes].to_vec())
         };
         let (width, height, pixels) = snapshot;
         let Some(buf) = ImageBuffer::<Rgba<u8>, _>::from_raw(width as u32, height as u32, pixels)
@@ -315,21 +311,39 @@ impl SessionView {
     }
 
     fn pointer_at(&mut self, position: Point<Pixels>) {
+        if self.show_menu || self.info_open || self.password_prompt {
+            return;
+        }
         if let Some((x, y)) = self.map_pointer(position) {
+            self.last_pointer = Some((x, y));
             self.send_pointer(x, y);
         }
     }
 
     fn button(&mut self, bit: u8, down: bool, position: Point<Pixels>) {
         if down {
+            if self.show_menu || self.info_open || self.password_prompt {
+                return;
+            }
+            let Some((x, y)) = self.map_pointer(position) else {
+                return;
+            };
             self.buttons |= bit;
+            self.last_pointer = Some((x, y));
+            self.send_pointer(x, y);
         } else {
             self.buttons &= !bit;
+            if let Some((x, y)) = self.map_pointer(position).or(self.last_pointer) {
+                self.last_pointer = Some((x, y));
+                self.send_pointer(x, y);
+            }
         }
-        self.pointer_at(position);
     }
 
     fn wheel(&mut self, ev: &ScrollWheelEvent) {
+        if self.show_menu || self.info_open || self.password_prompt {
+            return;
+        }
         let delta = ev.delta.pixel_delta(px(WHEEL_STEP));
         self.wheel_accum.x += f32::from(delta.x);
         self.wheel_accum.y += f32::from(delta.y);
@@ -420,7 +434,7 @@ impl SessionView {
     }
 
     fn reconnect(&mut self, cx: &mut Context<Self>) {
-        self.local_cursor.set_hidden(false);
+        self.password_prompt = false;
         self.handle = SessionHandle::spawn(self.req.clone());
         self.phase = Phase::Connecting;
         self.error = None;
@@ -434,8 +448,29 @@ impl SessionView {
         cx.notify();
     }
 
+    fn submit_password(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let password = self.prompt_input.read(cx).unmask_value().to_string();
+        if password.is_empty() {
+            self.status = "Enter the VNC password".into();
+            cx.notify();
+            return;
+        }
+        if self.remember_password {
+            if let Some(id) = self.req.connection_id {
+                if let Err(error) = rv_core::save_password(id, &password) {
+                    self.status = format!("Could not save password: {error}").into();
+                    cx.notify();
+                    return;
+                }
+            }
+        }
+        self.req.password = Some(password);
+        self.prompt_input
+            .update(cx, |input, cx| input.set_value("", window, cx));
+        self.reconnect(cx);
+    }
+
     fn close_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.local_cursor.set_hidden(false);
         self.disconnect(cx);
         window.remove_window();
     }
@@ -980,6 +1015,60 @@ impl SessionView {
             )
     }
 
+    fn render_password_prompt(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .id("password-prompt")
+            .occlude()
+            .absolute()
+            .inset_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(theme::scrim())
+            .child(
+                v_flex()
+                    .w(px(380.))
+                    .gap_3()
+                    .p_5()
+                    .rounded_lg()
+                    .bg(theme::card(cx))
+                    .border_1()
+                    .border_color(theme::line(cx))
+                    .shadow_lg()
+                    .text_color(theme::ink(cx))
+                    .child(
+                        div()
+                            .text_lg()
+                            .font_semibold()
+                            .child("VNC password required"),
+                    )
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(theme::muted(cx))
+                            .child(self.host()),
+                    )
+                    .child(Input::new(&self.prompt_input).mask_toggle())
+                    .child(
+                        h_flex()
+                            .justify_end()
+                            .gap_2()
+                            .child(Button::new("password-cancel").label("Cancel").on_click(
+                                cx.listener(|this, _, window, cx| this.close_window(window, cx)),
+                            ))
+                            .child(
+                                Button::new("password-connect")
+                                    .debug_selector(|| "password-connect".into())
+                                    .primary()
+                                    .label("Connect")
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.submit_password(window, cx)
+                                    })),
+                            ),
+                    ),
+            )
+    }
+
     fn render_picture(&self, cx: &Context<Self>) -> AnyElement {
         let Some(image) = self.render_image.clone() else {
             return v_flex()
@@ -1002,44 +1091,96 @@ impl SessionView {
         };
         let probe = {
             let cell = self.image_box.clone();
-            let update_cursor = cx.listener(|this, hovered: &bool, window, cx| {
-                this.canvas_hovered = *hovered;
-                this.update_local_cursor(window, cx);
+            let fb_w = self.fb_w;
+            let fb_h = self.fb_h;
+            let scale = self.scale;
+            let pointer_move = cx.listener(|this, position: &Point<Pixels>, _, _| {
+                this.pointer_at(*position);
             });
-            let on_move = cx.listener(|this, hovered: &bool, window, cx| {
-                this.pointer_in_window = true;
-                this.canvas_hovered = *hovered;
-                this.update_local_cursor(window, cx);
+            let pointer_down = cx.listener(|this, event: &(u8, Point<Pixels>), window, cx| {
+                this.focus.focus(window, cx);
+                if this.show_menu {
+                    this.show_menu = false;
+                    cx.notify();
+                }
+                this.button(event.0, true, event.1);
             });
-            let on_exit = cx.listener(|this, _: &MouseExitEvent, window, cx| {
-                // MouseExited can retain the last in-window coordinates. Keep
-                // subsequent video frames from hiding the cursor again.
-                this.pointer_in_window = false;
-                this.update_local_cursor(window, cx);
+            let pointer_up = cx.listener(|this, event: &(u8, Point<Pixels>), _, _| {
+                if this.buttons & event.0 != 0 {
+                    this.button(event.0, false, event.1);
+                }
+            });
+            let wheel_event = cx.listener(|this, event: &ScrollWheelEvent, _, _| {
+                this.wheel(event);
             });
             canvas(
                 move |bounds, window, _| {
                     cell.set(bounds);
                     window.insert_hitbox(bounds, HitboxBehavior::Normal)
                 },
-                move |_, hitbox, window, cx| {
+                move |_, hitbox, window, _cx| {
+                    // Paint with the same destination rectangle used by
+                    // map_pointer. Letting Img choose its own layout can
+                    // enlarge and crop a frame with a different aspect ratio.
+                    let bounds = hitbox.bounds;
+                    let (dx, dy, dw, dh) = dest_rect(
+                        f32::from(bounds.size.width),
+                        f32::from(bounds.size.height),
+                        fb_w,
+                        fb_h,
+                        scale,
+                    );
+                    let picture = Bounds {
+                        origin: point(bounds.origin.x + px(dx), bounds.origin.y + px(dy)),
+                        size: size(px(dw), px(dh)),
+                    };
+                    let _ = window.paint_image(
+                        picture,
+                        picture,
+                        Corners::default(),
+                        image.clone(),
+                        0,
+                        false,
+                    );
                     // Track the actual picture hitbox, including occluding UI.
-                    // Div::on_hover suppresses hover during dragging/typing,
-                    // which would bring the duplicate cursor back mid-session.
-                    let move_hitbox = hitbox.clone();
-                    window.on_mouse_event(move |_: &MouseMoveEvent, phase, window, cx| {
-                        if phase == DispatchPhase::Capture {
-                            on_move(&move_hitbox.should_handle_scroll(window), window, cx);
+                    let move_bounds = hitbox.bounds;
+                    window.on_mouse_event(move |event: &MouseMoveEvent, phase, window, cx| {
+                        if phase == DispatchPhase::Capture && move_bounds.contains(&event.position)
+                        {
+                            pointer_move(&event.position, window, cx);
                         }
                     });
-                    window.on_mouse_event(move |event: &MouseExitEvent, phase, window, cx| {
-                        if phase == DispatchPhase::Capture {
-                            on_exit(event, window, cx);
+                    let down_bounds = hitbox.bounds;
+                    window.on_mouse_event(move |event: &MouseDownEvent, phase, window, cx| {
+                        if phase == DispatchPhase::Capture && down_bounds.contains(&event.position)
+                        {
+                            let bit = match event.button {
+                                MouseButton::Left => BTN_LEFT,
+                                MouseButton::Middle => BTN_MIDDLE,
+                                MouseButton::Right => BTN_RIGHT,
+                                _ => return,
+                            };
+                            pointer_down(&(bit, event.position), window, cx);
                         }
                     });
-                    let hitbox = hitbox.clone();
-                    window.defer(cx, move |window, cx| {
-                        update_cursor(&hitbox.should_handle_scroll(window), window, cx);
+                    window.on_mouse_event(move |event: &MouseUpEvent, phase, window, cx| {
+                        if phase == DispatchPhase::Capture {
+                            let bit = match event.button {
+                                MouseButton::Left => BTN_LEFT,
+                                MouseButton::Middle => BTN_MIDDLE,
+                                MouseButton::Right => BTN_RIGHT,
+                                _ => return,
+                            };
+                            pointer_up(&(bit, event.position), window, cx);
+                        }
+                    });
+                    let wheel_bounds = hitbox.bounds;
+                    window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {
+                        if phase == DispatchPhase::Capture && wheel_bounds.contains(&event.position)
+                        {
+                            wheel_event(event, window, cx);
+                            cx.stop_propagation();
+                        }
                     });
                 },
             )
@@ -1047,18 +1188,9 @@ impl SessionView {
             .inset_0()
         };
         match self.scale {
-            ScaleMode::Fit | ScaleMode::Stretch => div()
-                .relative()
-                .size_full()
-                .child(img(image).id("fb").size_full().object_fit(
-                    if self.scale == ScaleMode::Fit {
-                        ObjectFit::Contain
-                    } else {
-                        ObjectFit::Fill
-                    },
-                ))
-                .child(probe)
-                .into_any_element(),
+            ScaleMode::Fit | ScaleMode::Stretch => {
+                div().relative().size_full().child(probe).into_any_element()
+            }
             ScaleMode::Actual => div()
                 .id("fb-scroll")
                 .size_full()
@@ -1077,7 +1209,6 @@ impl SessionView {
                                 .flex_shrink_0()
                                 .w(px(f32::from(self.fb_w)))
                                 .h(px(f32::from(self.fb_h)))
-                                .child(img(image).id("fb").size_full().object_fit(ObjectFit::Fill))
                                 .child(probe),
                         ),
                 )
@@ -1103,7 +1234,6 @@ impl Drop for SessionView {
 
 impl Render for SessionView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.update_local_cursor(window, cx);
         let fullscreen = window.is_fullscreen();
         let show_pinned = self.pin_toolbar;
 
@@ -1192,55 +1322,6 @@ impl Render for SessionView {
                             .size_full()
                             .bg(theme::desktop())
                             .cursor(CursorStyle::Arrow)
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|this, ev: &MouseDownEvent, window, cx| {
-                                    this.focus.focus(window, cx);
-                                    if this.show_menu {
-                                        this.show_menu = false;
-                                        cx.notify();
-                                    }
-                                    this.button(BTN_LEFT, true, ev.position);
-                                }),
-                            )
-                            .on_mouse_up(
-                                MouseButton::Left,
-                                cx.listener(|this, ev: &MouseUpEvent, _, _| {
-                                    this.button(BTN_LEFT, false, ev.position);
-                                }),
-                            )
-                            .on_mouse_down(
-                                MouseButton::Middle,
-                                cx.listener(|this, ev: &MouseDownEvent, window, cx| {
-                                    this.focus.focus(window, cx);
-                                    this.button(BTN_MIDDLE, true, ev.position);
-                                }),
-                            )
-                            .on_mouse_up(
-                                MouseButton::Middle,
-                                cx.listener(|this, ev: &MouseUpEvent, _, _| {
-                                    this.button(BTN_MIDDLE, false, ev.position);
-                                }),
-                            )
-                            .on_mouse_down(
-                                MouseButton::Right,
-                                cx.listener(|this, ev: &MouseDownEvent, window, cx| {
-                                    this.focus.focus(window, cx);
-                                    this.button(BTN_RIGHT, true, ev.position);
-                                }),
-                            )
-                            .on_mouse_up(
-                                MouseButton::Right,
-                                cx.listener(|this, ev: &MouseUpEvent, _, _| {
-                                    this.button(BTN_RIGHT, false, ev.position);
-                                }),
-                            )
-                            .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _, _| {
-                                this.pointer_at(ev.position);
-                            }))
-                            .on_scroll_wheel(cx.listener(|this, ev: &ScrollWheelEvent, _, _| {
-                                this.wheel(ev);
-                            }))
                             .child(self.render_picture(cx)),
                     )
                     .when(!show_pinned && self.phase != Phase::Ended, |this| {
@@ -1250,9 +1331,13 @@ impl Render for SessionView {
                     .when(self.show_menu, |this| {
                         this.child(self.render_menu(fullscreen, cx))
                     })
-                    .when(self.phase == Phase::Ended, |this| {
-                        this.child(self.render_ended(cx))
-                    }),
+                    .when(self.password_prompt, |this| {
+                        this.child(self.render_password_prompt(cx))
+                    })
+                    .when(
+                        self.phase == Phase::Ended && !self.password_prompt,
+                        |this| this.child(self.render_ended(cx)),
+                    ),
             )
     }
 }
@@ -1261,6 +1346,29 @@ impl Render for SessionView {
 ///
 /// `box_w`/`box_h` is the element the picture is drawn in; for Fit the image
 /// is letterboxed inside it, for Stretch and 1:1 it fills it.
+/// x11vnc's -ncache puts several screen-sized cache areas below the real
+/// desktop in one very tall RFB framebuffer. Match the common screen ratios
+/// only when the advertised height is an exact large multiple.
+fn visible_fb_height(width: u16, height: u16) -> u16 {
+    if width == 0 || (height as u32) < (width as u32) * 3 {
+        return height;
+    }
+    for (numerator, denominator) in [(9, 16), (10, 16), (3, 4)] {
+        let scaled = width as u32 * numerator;
+        if scaled % denominator != 0 {
+            continue;
+        }
+        let screen_height = scaled / denominator;
+        if (600..=4320).contains(&screen_height)
+            && (height as u32).is_multiple_of(screen_height)
+            && (3..=32).contains(&((height as u32) / screen_height))
+        {
+            return screen_height as u16;
+        }
+    }
+    height
+}
+
 fn map_to_fb(
     local_x: f32,
     local_y: f32,
@@ -1439,78 +1547,6 @@ fn disable_platform_ime(window: &Window) {
     macos_ime::disable(window);
 }
 
-mod local_cursor {
-    /// Owns exactly one balanced hide/unhide pair, even if the window is closed
-    /// while the pointer is hidden. Repaints and mouse moves must not stack hides.
-    #[derive(Default)]
-    pub struct LocalCursor {
-        hidden: bool,
-    }
-
-    impl LocalCursor {
-        #[cfg(test)]
-        pub(super) fn is_hidden(&self) -> bool {
-            self.hidden
-        }
-
-        pub fn set_hidden(&mut self, hidden: bool) {
-            if self.hidden != hidden {
-                set_platform_hidden(hidden);
-                self.hidden = hidden;
-            }
-        }
-    }
-
-    impl Drop for LocalCursor {
-        fn drop(&mut self) {
-            self.set_hidden(false);
-        }
-    }
-
-    #[cfg(all(target_os = "macos", not(test)))]
-    fn set_platform_hidden(hidden: bool) {
-        use objc2_app_kit::NSCursor;
-
-        if hidden {
-            NSCursor::hide();
-        } else {
-            NSCursor::unhide();
-        }
-    }
-
-    #[cfg(all(not(target_os = "macos"), not(test)))]
-    fn set_platform_hidden(_: bool) {}
-
-    #[cfg(test)]
-    std::thread_local! {
-        static TRANSITIONS: std::cell::RefCell<Vec<bool>> = const { std::cell::RefCell::new(Vec::new()) };
-    }
-
-    #[cfg(test)]
-    fn set_platform_hidden(hidden: bool) {
-        TRANSITIONS.with_borrow_mut(|transitions| transitions.push(hidden));
-    }
-
-    #[test]
-    fn repeated_updates_and_window_close_balance_cursor_hiding() {
-        TRANSITIONS.with_borrow_mut(Vec::clear);
-        {
-            let mut cursor = LocalCursor::default();
-            cursor.set_hidden(false);
-            cursor.set_hidden(true);
-            cursor.set_hidden(true); // Mouse moves and frame updates.
-            cursor.set_hidden(false); // Leave the picture or lose focus.
-            cursor.set_hidden(false);
-            cursor.set_hidden(true); // Return to the remote desktop.
-        } // Closing the window must restore the cursor.
-        TRANSITIONS.with_borrow(|transitions| {
-            assert_eq!(transitions, &[true, false, true, false]);
-        });
-        drop(LocalCursor::default());
-        TRANSITIONS.with_borrow(|transitions| assert_eq!(transitions.len(), 4));
-    }
-}
-
 #[cfg(test)]
 mod ui_tests;
 
@@ -1556,7 +1592,15 @@ mod macos_ime {
 #[cfg(test)]
 mod tests {
     // Not `super::*`: the `gpui::*` glob would shadow `#[test]`.
-    use super::{ScaleMode, map_to_fb};
+    use super::{ScaleMode, map_to_fb, visible_fb_height};
+
+    #[test]
+    fn hides_x11vnc_cache_rows_below_the_desktop() {
+        assert_eq!(visible_fb_height(1920, 12960), 1080);
+        assert_eq!(visible_fb_height(1920, 1080), 1080);
+        assert_eq!(visible_fb_height(1920, 1296), 1296);
+        assert_eq!(visible_fb_height(1024, 9216), 768);
+    }
 
     #[test]
     fn fit_letterboxes_and_maps_corners() {

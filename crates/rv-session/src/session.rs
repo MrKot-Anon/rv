@@ -31,6 +31,7 @@ const MAX_EVENTS_PER_SLOT: usize = 64;
 #[derive(Debug, Clone)]
 pub enum SessionEvent {
     Status(String),
+    PasswordRequired,
     Connected { width: u16, height: u16 },
     FrameReady { generation: u64 },
     Clipboard(String),
@@ -204,6 +205,7 @@ async fn run(
 
     match connect_and_loop(request, fb, &mut cmd_rx, &send).await {
         Ok(()) => send(SessionEvent::Disconnected),
+        Err(SessionError::PasswordRequired) => send(SessionEvent::PasswordRequired),
         Err(e) => {
             send(SessionEvent::Error(e.to_string()));
             send(SessionEvent::Disconnected);
@@ -300,11 +302,26 @@ async fn connect(
     let addr = format!("{}:{}", request.host, request.port);
     let mut tcp = dial(&addr).await?;
     let types = vencrypt::read_security_types(&mut tcp).await?;
-    let stream = match choose_transport(
+    let transport = choose_transport(
         request.encryption,
         &types,
         request.username.as_ref().is_some_and(|u| !u.is_empty()),
-    )? {
+    )?;
+    let missing_password = request.password.as_deref().is_none_or(str::is_empty);
+    if missing_password
+        && matches!(transport, Transport::Plain)
+        && types.contains(&vencrypt::SEC_VNC_AUTH)
+        && !types.contains(&vencrypt::SEC_NONE)
+    {
+        return Err(SessionError::PasswordRequired);
+    }
+    if missing_password
+        && matches!(transport, Transport::Ard)
+        && request.username.as_deref().is_some_and(|u| !u.is_empty())
+    {
+        return Err(SessionError::PasswordRequired);
+    }
+    let stream = match transport {
         Transport::Plain => vencrypt::RfbStream::plain(tcp, &types),
         Transport::Ard => {
             send(SessionEvent::Status(
@@ -324,7 +341,11 @@ async fn connect(
         }
         Transport::VeNCrypt => {
             send(SessionEvent::Status("Negotiating VeNCrypt…".into()));
-            vencrypt::handshake(tcp, &request.host).await?
+            let (stream, auth) = vencrypt::handshake(tcp, &request.host).await?;
+            if missing_password && auth == vencrypt::VencryptAuth::Vnc {
+                return Err(SessionError::PasswordRequired);
+            }
+            stream
         }
     };
 
@@ -446,6 +467,14 @@ fn handle_event(
     announced: &mut bool,
 ) {
     let mut fb = fb.lock().expect("framebuffer lock");
+    if let VncEvent::SetResolution(screen) = &ev
+        && std::env::var_os("RV_TRACE_RESIZE").is_some()
+    {
+        eprintln!(
+            "VNC resolution: {}x{}, previous: {}x{}, initial: {}",
+            screen.width, screen.height, fb.width, fb.height, !*announced
+        );
+    }
     match fb.apply(ev) {
         Apply::Resized => {
             if !*announced && fb.width > 0 {

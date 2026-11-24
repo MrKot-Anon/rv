@@ -232,7 +232,10 @@ unsafe impl Sync for RfbStream {}
 /// Run the VeNCrypt sub-handshake on a socket whose security list offered
 /// type 19, then bring up TLS. Returns a stream ready for `vnc-rs` to
 /// perform None / VncAuth on.
-pub async fn handshake(mut stream: TcpStream, host: &str) -> Result<RfbStream, SessionError> {
+pub async fn handshake(
+    mut stream: TcpStream,
+    host: &str,
+) -> Result<(RfbStream, VencryptAuth), SessionError> {
     stream.write_u8(VENCRYPT_SECURITY_TYPE).await?;
 
     let major = stream.read_u8().await?;
@@ -277,7 +280,7 @@ pub async fn handshake(mut stream: TcpStream, host: &str) -> Result<RfbStream, S
     } else {
         Transport::Anonymous(Box::new(anonymous_tls(stream).await?))
     };
-    Ok(RfbStream::negotiated(transport, auth))
+    Ok((RfbStream::negotiated(transport, auth), auth))
 }
 
 /// Choose the VeNCrypt subtype: keep VncAuth over None, and prefer a

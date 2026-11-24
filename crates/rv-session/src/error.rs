@@ -2,6 +2,8 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum SessionError {
+    #[error("VNC server requires a password")]
+    PasswordRequired,
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
     #[error("VNC error: {0}")]

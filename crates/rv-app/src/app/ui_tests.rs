@@ -100,13 +100,41 @@ fn offscreen_invalid_server_keeps_editor_open(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn offscreen_password_can_be_revealed_in_connection_editor(cx: &mut TestAppContext) {
+    let (app, cx, _dir) = setup(cx, vec![]);
+    cx.simulate_keystrokes("ctrl-n");
+    cx.update(|window, cx| {
+        app.update(cx, |app, cx| {
+            app.password_input
+                .update(cx, |input, cx| input.set_value("secret", window, cx));
+        });
+    });
+    app.read_with(cx, |app, cx| {
+        assert!(app.password_input.read(cx).presentation().is_masked());
+        assert_eq!(
+            app.password_input.read(cx).unmask_value().as_ref(),
+            "secret"
+        );
+    });
+    click(cx, "show-password");
+    app.read_with(cx, |app, cx| {
+        assert!(app.show_password);
+        assert!(!app.password_input.read(cx).presentation().is_masked());
+        assert_eq!(
+            app.password_input.read(cx).unmask_value().as_ref(),
+            "secret"
+        );
+    });
+}
+
+#[gpui::test]
 fn offscreen_busy_editor_blocks_buttons_and_duplicate_actions(cx: &mut TestAppContext) {
     let (app, cx, _dir) = setup(cx, vec![]);
     cx.simulate_keystrokes("ctrl-n");
     cx.simulate_input("example.test");
     app.update(cx, |app, cx| {
         app.credential_busy = true;
-        app.status = "Unlocking saved password…".into();
+        app.status = "Loading saved password…".into();
         cx.notify();
     });
     for selector in ["modal-save", "modal-connect", "modal-cancel"] {
@@ -119,7 +147,7 @@ fn offscreen_busy_editor_blocks_buttons_and_duplicate_actions(cx: &mut TestAppCo
         assert!(matches!(app.modal, Modal::Connection));
         assert!(app.book.connections().is_empty());
         assert_eq!(app.server_input.read(cx).value().as_ref(), "example.test");
-        assert_eq!(app.status.as_ref(), "Unlocking saved password…");
+        assert_eq!(app.status.as_ref(), "Loading saved password…");
     });
     app.update(cx, |app, cx| {
         app.credential_busy = false;

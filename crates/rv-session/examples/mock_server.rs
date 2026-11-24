@@ -68,7 +68,7 @@ fn read_exact<S: Read>(s: &mut S, n: usize) -> std::io::Result<Vec<u8>> {
 }
 
 /// Frame in the BGRA layout the viewer negotiates.
-fn frame_bgra(t: f32) -> Vec<u8> {
+fn frame_bgra(t: f32, pointer: Option<(u16, u16)>) -> Vec<u8> {
     let (WIDTH, HEIGHT) = size();
     let mut px = vec![0u8; WIDTH as usize * HEIGHT as usize * 4];
     let cx = (WIDTH as f32 * (0.5 + 0.35 * t.sin())) as i32;
@@ -92,6 +92,17 @@ fn frame_bgra(t: f32) -> Vec<u8> {
             px[i + 1] = g;
             px[i + 2] = r;
             px[i + 3] = 255;
+        }
+    }
+    if let Some((x, y)) = pointer {
+        // White crosshair shows exactly where this server received the cursor.
+        for (dx, dy) in (-12..=12).map(|v| (v, 0)).chain((-12..=12).map(|v| (0, v))) {
+            let px_x = x as i32 + dx;
+            let px_y = y as i32 + dy;
+            if (0..WIDTH as i32).contains(&px_x) && (0..HEIGHT as i32).contains(&px_y) {
+                let i = ((px_y * WIDTH as i32 + px_x) * 4) as usize;
+                px[i..i + 4].copy_from_slice(&[255, 255, 255, 255]);
+            }
         }
     }
     px
@@ -172,6 +183,7 @@ fn serve(sock: TcpStream) -> std::io::Result<()> {
     sock.write_all(name)?;
 
     let start = Instant::now();
+    let mut pointer = None;
     while let Ok(message) = read_exact(&mut sock, 1) {
         match message[0] {
             0 => {
@@ -185,7 +197,7 @@ fn serve(sock: TcpStream) -> std::io::Result<()> {
             3 => {
                 let _ = read_exact(&mut sock, 9)?;
                 let t = start.elapsed().as_secs_f32();
-                let pixels = frame_bgra(t);
+                let pixels = frame_bgra(t, pointer);
                 let n = rects().clamp(1, HEIGHT);
                 let strip = HEIGHT / n;
                 sock.write_all(&[0, 0])?;
@@ -217,8 +229,9 @@ fn serve(sock: TcpStream) -> std::io::Result<()> {
                 let b = read_exact(&mut sock, 5)?;
                 let x = u16::from_be_bytes([b[1], b[2]]);
                 let y = u16::from_be_bytes([b[3], b[4]]);
-                // Only log button transitions; motion would flood the log.
-                if b[0] != 0 {
+                pointer = Some((x, y));
+                // Enable full motion logging for local pointer diagnostics.
+                if b[0] != 0 || matches!(std::env::var("RV_MOCK_LOG_MOTION").as_deref(), Ok("1")) {
                     eprintln!(
                         "[{}] pointer buttons=0b{:08b} at ({x}, {y})",
                         now_ms(),

@@ -49,9 +49,7 @@ fn main() {
                     }
                 })
                 .expect("open address book");
-            // Connect only after the window has painted: loading the saved
-            // password may pop a modal Keychain prompt, and the user should
-            // see the address book behind it rather than nothing.
+            // Connect only after the address book window has painted.
             let book = slot.borrow().clone();
             if let (Some(target), Some(book)) = (connect_to, book) {
                 cx.background_executor()

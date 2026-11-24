@@ -93,6 +93,7 @@ pub struct AddressBookApp {
     server_input: Entity<InputState>,
     username_input: Entity<InputState>,
     password_input: Entity<InputState>,
+    show_password: bool,
     labels_input: Entity<InputState>,
     collapsed: bool,
     view_mode: ViewMode,
@@ -206,6 +207,7 @@ impl AddressBookApp {
             server_input,
             username_input,
             password_input,
+            show_password: false,
             labels_input,
             collapsed: false,
             view_mode: ViewMode::Grid,
@@ -290,8 +292,22 @@ impl AddressBookApp {
             .update(cx, |s, cx| s.set_value(server, window, cx));
         self.username_input
             .update(cx, |s, cx| s.set_value(username, window, cx));
-        self.password_input
-            .update(cx, |s, cx| s.set_value("", window, cx));
+        self.show_password = false;
+        let saved_password = if let Some(c) = conn.filter(|c| c.remember_password) {
+            match load_password(c.id) {
+                Ok(password) => password.unwrap_or_default(),
+                Err(error) => {
+                    self.set_status(format!("Could not load saved password: {error}"), cx);
+                    String::new()
+                }
+            }
+        } else {
+            String::new()
+        };
+        self.password_input.update(cx, |s, cx| {
+            s.set_value(saved_password, window, cx);
+            s.set_masked(true, window, cx);
+        });
         self.labels_input
             .update(cx, |s, cx| s.set_value(labels, window, cx));
         self.modal = Modal::Connection;
@@ -459,7 +475,7 @@ impl AddressBookApp {
         self.credential_busy = true;
         self.set_status(
             if remember {
-                "Unlocking saved password…"
+                "Loading saved password…"
             } else {
                 "Preparing connection…"
             },
@@ -507,6 +523,10 @@ impl AddressBookApp {
             menu_key: prefs.menu_key.clone(),
             hide_shots: prefs.hide_screenshots,
             thumb_path: req.connection_id.map(|id| self.book.paths().thumb_path(id)),
+            remember_password: req
+                .connection_id
+                .and_then(|id| self.book.get(id))
+                .is_some_and(|conn| conn.remember_password),
         };
         session_window::open(req, title, options, cx);
         cx.notify();
@@ -948,18 +968,30 @@ impl AddressBookApp {
         let body: AnyElement = match &self.modal {
             Modal::Connection => v_flex()
                 .gap_3()
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(theme::muted(cx))
+                        .child(self.status.clone()),
+                )
                 .child(field("VNC server", Input::new(&self.server_input), cx))
                 .child(field("Name", Input::new(&self.name_input), cx))
                 .child(field("Username", Input::new(&self.username_input), cx))
                 .child(field("Password", Input::new(&self.password_input), cx))
-                .when(self.editing.is_some() && self.remember_password, |this| {
-                    this.child(
-                        div()
-                            .text_xs()
-                            .text_color(theme::muted(cx))
-                            .child("Leave the password blank to keep the saved password."),
-                    )
-                })
+                .child(
+                    div().debug_selector(|| "show-password".into()).child(
+                        Switch::new("show-password")
+                            .checked(self.show_password)
+                            .label("Show password")
+                            .on_click(cx.listener(|this, show: &bool, window, cx| {
+                                this.show_password = *show;
+                                this.password_input.update(cx, |input, cx| {
+                                    input.set_masked(!show, window, cx);
+                                });
+                                cx.notify();
+                            })),
+                    ),
+                )
                 .child(field("Labels", Input::new(&self.labels_input), cx))
                 .child(connection_options(self, cx))
                 .child(
