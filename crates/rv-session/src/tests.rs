@@ -148,6 +148,7 @@ fn request_for(port: u16) -> ConnectRequest {
         password: None,
         encryption: EncryptionMode::Off,
         quality: QualityPreset::Fast,
+        host_os: rv_core::HostOs::Ubuntu,
         view_only: false,
         shared: true,
     }

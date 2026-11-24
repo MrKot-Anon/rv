@@ -105,6 +105,10 @@ pub struct SessionView {
     image_box: Rc<Cell<Bounds<Pixels>>>,
     keys: Keyboard,
     focus: FocusHandle,
+    #[cfg(target_os = "macos")]
+    last_layout_generation: u64,
+    #[cfg(target_os = "macos")]
+    local_source_id: Option<String>,
 }
 
 impl SessionView {
@@ -154,6 +158,27 @@ impl SessionView {
         })
         .detach();
 
+        #[cfg(target_os = "macos")]
+        cx.spawn_in(window, async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(50))
+                    .await;
+                if this
+                    .update_in(cx, |this, window, _| this.check_local_layout(window))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
+
+        #[cfg(target_os = "macos")]
+        let last_layout_generation = crate::macos_layout::generation();
+        #[cfg(target_os = "macos")]
+        let local_source_id = crate::macos_layout::current_source_id();
+
         Self {
             req,
             handle,
@@ -182,6 +207,10 @@ impl SessionView {
             image_box: Rc::new(Cell::new(Bounds::default())),
             keys: Keyboard::new(),
             focus,
+            #[cfg(target_os = "macos")]
+            last_layout_generation,
+            #[cfg(target_os = "macos")]
+            local_source_id,
         }
     }
 
@@ -383,6 +412,38 @@ impl SessionView {
         for (keysym, down) in events {
             self.handle.key(keysym, down);
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn check_local_layout(&mut self, window: &Window) {
+        let generation = crate::macos_layout::generation();
+        if generation == self.last_layout_generation {
+            return;
+        }
+        self.last_layout_generation = generation;
+        let Some(source_id) = crate::macos_layout::current_source_id() else {
+            return;
+        };
+        let changed = self
+            .local_source_id
+            .replace(source_id.clone())
+            .is_some_and(|previous| previous != source_id);
+        if !changed
+            || !window.is_window_active()
+            || !self.focus.is_focused(window)
+            || self.phase != Phase::Connected
+            || self.view_only()
+            || self.show_menu
+            || self.info_open
+            || self.password_prompt
+        {
+            return;
+        }
+        // A local shortcut may have left a modifier held remotely. Clear it
+        // before sending the host's layout shortcut as a complete key pair.
+        let released = self.keys.release_all();
+        self.send_keys(released);
+        self.send_keys(self.req.host_os.layout_switch_events());
     }
 
     fn tap_key(&mut self, keysym: u32) {
@@ -905,6 +966,7 @@ impl SessionView {
             ("Scaling", self.scale.label().into()),
             ("Encryption", self.req.encryption.label().into()),
             ("Quality", self.req.quality.label().into()),
+            ("Host OS", self.req.host_os.label().into()),
             (
                 "Access",
                 if self.view_only() {

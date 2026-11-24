@@ -18,7 +18,7 @@ use gpui_component::{
 };
 
 use rv_core::{
-    AddressBook, ConnectRequest, Connection, ConnectionId, EncryptionMode, QualityPreset,
+    AddressBook, ConnectRequest, Connection, ConnectionId, EncryptionMode, HostOs, QualityPreset,
     delete_password, load_password, parse_server, save_password,
 };
 
@@ -102,6 +102,7 @@ pub struct AddressBookApp {
     remember_password: bool,
     encryption: EncryptionMode,
     quality: QualityPreset,
+    host_os: HostOs,
     view_only: bool,
     shared: bool,
     editing: Option<ConnectionId>,
@@ -216,6 +217,7 @@ impl AddressBookApp {
             remember_password: true,
             encryption: EncryptionMode::LetServerChoose,
             quality: QualityPreset::Auto,
+            host_os: HostOs::Ubuntu,
             view_only: false,
             shared: true,
             editing: None,
@@ -283,6 +285,7 @@ impl AddressBookApp {
         self.editing = conn.map(|c| c.id);
         self.encryption = conn.map_or(EncryptionMode::LetServerChoose, |c| c.encryption);
         self.quality = conn.map_or(QualityPreset::Auto, |c| c.quality);
+        self.host_os = conn.map_or(HostOs::Ubuntu, |c| c.host_os);
         self.view_only = conn.is_some_and(|c| c.view_only);
         self.shared = conn.is_none_or(|c| c.shared);
         self.remember_password = conn.is_none_or(|c| c.remember_password);
@@ -378,6 +381,7 @@ impl AddressBookApp {
         conn.labels = labels;
         conn.encryption = self.encryption;
         conn.quality = self.quality;
+        conn.host_os = self.host_os;
         conn.view_only = self.view_only;
         conn.shared = self.shared;
         let forget_password = conn.remember_password && !self.remember_password;
@@ -1508,6 +1512,23 @@ fn connection_options(app: &AddressBookApp, cx: &mut Context<AddressBookApp>) ->
         .pt_2()
         .border_t_1()
         .border_color(theme::line(cx))
+        .child(setting_row(
+            "Host OS",
+            Button::new("host-os")
+                .debug_selector(|| "host-os".into())
+                .outline()
+                .small()
+                .label(app.host_os.label())
+                .tooltip(format!(
+                    "Local layout changes send {} to the server; click to change OS",
+                    app.host_os.layout_shortcut_label()
+                ))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.host_os = this.host_os.cycle();
+                    cx.notify();
+                })),
+            cx,
+        ))
         .child(setting_row(
             "Encryption",
             Button::new("enc")

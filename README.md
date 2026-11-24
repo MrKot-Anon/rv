@@ -48,6 +48,12 @@ rv [2001:db8::1]:2   # IPv6
 
 Ctrl / Alt / ⌘ are forwarded to the remote desktop while a session has focus.
 
+In a connection's **Host OS** setting, choose Ubuntu (the default), Windows,
+or macOS. On a Mac client, RV reacts to the system input-source change event,
+regardless of which local key shortcut triggered it. It sends Super+Space to
+Ubuntu, Alt+Shift to Windows, or Control+Space to macOS. The remote desktop
+must have that shortcut enabled for its input sources.
+
 ## Tests
 
 ```bash

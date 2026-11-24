@@ -43,6 +43,7 @@ fn click(cx: &mut VisualTestContext, selector: &'static str) {
 fn offscreen_save_connection_persists_form_and_clears_password(cx: &mut TestAppContext) {
     let (app, cx, dir) = setup(cx, vec![]);
     cx.simulate_keystrokes("ctrl-n");
+    click(cx, "host-os");
     app.update(cx, |app, cx| {
         assert!(matches!(app.modal, Modal::Connection));
         app.remember_password = false;
@@ -76,6 +77,7 @@ fn offscreen_save_connection_persists_form_and_clears_password(cx: &mut TestAppC
         ("Office", "example.test", 5902)
     );
     assert_eq!(saved.username.as_deref(), Some("mac-user"));
+    assert_eq!(saved.host_os, rv_core::HostOs::Windows);
     assert_eq!(
         ConnectRequest::from_connection(saved, None).username,
         saved.username

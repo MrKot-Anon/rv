@@ -7,7 +7,7 @@ mod prefs;
 mod store;
 
 pub use connection::{
-    ConnectRequest, Connection, ConnectionId, EncryptionMode, QualityPreset, ScaleMode,
+    ConnectRequest, Connection, ConnectionId, EncryptionMode, HostOs, QualityPreset, ScaleMode,
     parse_server,
 };
 pub use keyboard::{Keyboard, keysym_for_keystroke};

@@ -1,5 +1,7 @@
 mod actions;
 mod app;
+#[cfg(target_os = "macos")]
+mod macos_layout;
 mod session_window;
 mod theme;
 

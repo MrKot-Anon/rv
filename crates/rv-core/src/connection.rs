@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::keysym::{XK_ALT_L, XK_CONTROL_L, XK_SHIFT_L, XK_SPACE, XK_SUPER_L};
+
 /// Stable identity for a saved connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ConnectionId(pub Uuid);
@@ -84,6 +86,55 @@ impl QualityPreset {
     }
 }
 
+/// OS running on the VNC server, used for its default input-source shortcut.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum HostOs {
+    #[default]
+    Ubuntu,
+    Windows,
+    MacOS,
+}
+
+impl HostOs {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Ubuntu => "Ubuntu",
+            Self::Windows => "Windows",
+            Self::MacOS => "macOS",
+        }
+    }
+
+    pub fn cycle(self) -> Self {
+        match self {
+            Self::Ubuntu => Self::Windows,
+            Self::Windows => Self::MacOS,
+            Self::MacOS => Self::Ubuntu,
+        }
+    }
+
+    pub fn layout_shortcut_label(self) -> &'static str {
+        match self {
+            Self::Ubuntu => "Super+Space",
+            Self::Windows => "Alt+Shift",
+            Self::MacOS => "Control+Space",
+        }
+    }
+
+    pub fn layout_switch_events(self) -> [(u32, bool); 4] {
+        let (modifier, key) = match self {
+            Self::Ubuntu => (XK_SUPER_L, XK_SPACE),
+            Self::Windows => (XK_ALT_L, XK_SHIFT_L),
+            Self::MacOS => (XK_CONTROL_L, XK_SPACE),
+        };
+        [
+            (modifier, true),
+            (key, true),
+            (key, false),
+            (modifier, false),
+        ]
+    }
+}
+
 /// How the remote desktop is fitted into the session window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum ScaleMode {
@@ -127,6 +178,8 @@ pub struct Connection {
     #[serde(default)]
     pub quality: QualityPreset,
     #[serde(default)]
+    pub host_os: HostOs,
+    #[serde(default)]
     pub view_only: bool,
     #[serde(default = "default_shared")]
     pub shared: bool,
@@ -160,6 +213,7 @@ impl Connection {
             remember_password: false,
             encryption: EncryptionMode::default(),
             quality: QualityPreset::default(),
+            host_os: HostOs::default(),
             view_only: false,
             shared: true,
             labels: Vec::new(),
@@ -183,6 +237,7 @@ pub struct ConnectRequest {
     pub password: Option<String>,
     pub encryption: EncryptionMode,
     pub quality: QualityPreset,
+    pub host_os: HostOs,
     pub view_only: bool,
     pub shared: bool,
 }
@@ -198,6 +253,7 @@ impl ConnectRequest {
             password,
             encryption: conn.encryption,
             quality: conn.quality,
+            host_os: conn.host_os,
             view_only: conn.view_only,
             shared: conn.shared,
         }
@@ -344,11 +400,42 @@ mod tests {
 
     #[test]
     fn connection_round_trip() {
-        let c = Connection::new("office", "10.0.0.8", 5900);
+        let mut c = Connection::new("office", "10.0.0.8", 5900);
+        c.host_os = HostOs::Windows;
         let json = serde_json::to_string(&c).unwrap();
         let back: Connection = serde_json::from_str(&json).unwrap();
         assert_eq!(back.name, "office");
         assert_eq!(back.port, 5900);
         assert!(back.shared);
+        assert_eq!(back.host_os, HostOs::Windows);
+        assert_eq!(
+            ConnectRequest::from_connection(&back, None).host_os,
+            HostOs::Windows
+        );
+    }
+
+    #[test]
+    fn older_connections_default_to_ubuntu() {
+        let c = Connection::new("office", "example.test", 5900);
+        let mut value = serde_json::to_value(c).unwrap();
+        value.as_object_mut().unwrap().remove("host_os");
+        let loaded: Connection = serde_json::from_value(value).unwrap();
+        assert_eq!(loaded.host_os, HostOs::Ubuntu);
+    }
+
+    #[test]
+    fn host_os_uses_expected_layout_shortcut() {
+        assert_eq!(HostOs::Ubuntu.layout_shortcut_label(), "Super+Space");
+        assert_eq!(HostOs::Windows.layout_shortcut_label(), "Alt+Shift");
+        assert_eq!(HostOs::MacOS.layout_shortcut_label(), "Control+Space");
+        assert_eq!(
+            HostOs::Windows.layout_switch_events(),
+            [
+                (XK_ALT_L, true),
+                (XK_SHIFT_L, true),
+                (XK_SHIFT_L, false),
+                (XK_ALT_L, false),
+            ]
+        );
     }
 }
